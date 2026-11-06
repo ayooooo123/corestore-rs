@@ -1,0 +1,26 @@
+[package]
+name = "corestore-rs"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+license = "MIT OR Apache-2.0"
+description = "Corestore for hypercore-rs: named cores, namespaces and one replication stream for all, compatible with npm corestore"
+keywords = ["hypercore", "corestore", "p2p", "holepunch"]
+categories = ["network-programming"]
+
+[lib]
+name = "corestore"
+
+[dependencies]
+blake2b_simd = "1"
+hypercore-rs = { path = "../hypercore-rs" }
+protomux-rs = { path = "../protomux-rs" }
+rand = "0.8"
+tokio = { version = "1.40", features = ["sync", "rt", "time"] }
+
+[dev-dependencies]
+peeroxide-dht = "1.7.4"
+tempfile = "3"
+tokio = { version = "1.40", features = ["full", "test-util"] }
+serde_json = "1"
+sha2 = "0.10"

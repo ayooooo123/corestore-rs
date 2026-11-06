@@ -1,0 +1,10 @@
+{
+  "name": "corestore-rs-interop",
+  "private": true,
+  "description": "npm corestore peer and key fixtures for corestore-rs tests",
+  "dependencies": {
+    "@hyperswarm/secret-stream": "6.9.2",
+    "corestore": "7.16.1",
+    "hypercore": "11.39.5"
+  }
+}
