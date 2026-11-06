@@ -5,6 +5,6 @@
   "dependencies": {
     "@hyperswarm/secret-stream": "6.9.2",
     "corestore": "7.16.1",
-    "hypercore": "11.39.5"
+    "hypercore": "11.40.3"
   }
 }
