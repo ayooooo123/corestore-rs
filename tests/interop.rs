@@ -1,4 +1,5 @@
-//! npm corestore against corestore-rs over secret-stream on TCP.
+//! npm corestore against corestore-rs over Hyperswarm/peeroxide on a local
+//! HyperDHT testnet: holepunch handshake, UDX, secret-stream, as apps run.
 
 use std::path::Path;
 use std::process::Stdio;
@@ -6,13 +7,15 @@ use std::time::Duration;
 
 use corestore::{Corestore, GetOptions};
 use hypercore::GetOptions as Get;
-use peeroxide_dht::noise::generate_keypair;
-use peeroxide_dht::secret_stream::SecretStream;
+use peeroxide::{JoinOpts, SwarmConfig, SwarmHandle, spawn};
+use peeroxide_dht::hyperdht::HyperDhtConfig;
+use peeroxide_dht::rpc::DhtConfig;
 use protomux::Mux;
 use tokio::io::{AsyncBufReadExt, BufReader, Lines};
-use tokio::net::{TcpListener, TcpStream};
 use tokio::process::{Child, ChildStdout, Command};
 use tokio::time::timeout;
+
+const TOPIC: [u8; 32] = [0x5c; 32];
 
 fn node(args: &[&str]) -> (Child, Lines<BufReader<ChildStdout>>) {
     let dir = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/js"));
@@ -26,11 +29,39 @@ fn node(args: &[&str]) -> (Child, Lines<BufReader<ChildStdout>>) {
         .args(args)
         .current_dir(dir)
         .stdout(Stdio::piped())
+        .stdin(Stdio::piped())
         .kill_on_drop(true)
         .spawn()
         .expect("node on PATH");
     let lines = BufReader::new(child.stdout.take().unwrap()).lines();
     (child, lines)
+}
+
+/// A peeroxide swarm on the testnet that replicates `store` on every connection.
+async fn swarm(port: &str, store: &Corestore, client: bool) -> SwarmHandle {
+    let mut dht = DhtConfig::default();
+    dht.bootstrap = vec![format!("127.0.0.1:{port}")];
+    dht.host = "127.0.0.1".into();
+    dht.port = 0;
+    let mut hyper = HyperDhtConfig::default();
+    hyper.dht = dht;
+    let mut config = SwarmConfig::default();
+    config.dht = hyper;
+    let (_task, handle, mut conns) = spawn(config).await.expect("peeroxide swarm");
+    let store = store.clone();
+    tokio::spawn(async move {
+        while let Some(conn) = conns.recv().await {
+            store.replicate(&Mux::from_secret_stream(conn.peer.stream));
+        }
+    });
+    let mut opts = JoinOpts::default();
+    opts.client = client;
+    opts.server = !client;
+    handle.join(TOPIC, opts).await.unwrap();
+    if !client {
+        handle.flush().await.unwrap();
+    }
+    handle
 }
 
 async fn line(out: &mut Lines<BufReader<ChildStdout>>, prefix: &str) -> String {
@@ -85,35 +116,33 @@ async fn js_reads_any_stored_rust_core() {
             Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
         }
     };
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port().to_string();
+    let (_testnet, mut tn) = node(&["testnet"]);
+    let port = line(&mut tn, "bootstrap ").await;
+    let swarm = swarm(&port, &store, false).await;
     let js = tmp.path().join("js");
-    let mut args = vec!["read", js.to_str().unwrap(), &port];
+    let topic = hex(&TOPIC);
+    let mut args = vec!["read", js.to_str().unwrap(), &port, &topic];
     let keys: Vec<String> = expected.iter().map(|(k, _)| k.clone()).collect();
     args.extend(keys.iter().map(String::as_str));
     let (_child, mut out) = node(&args);
-    let (tcp, _) = listener.accept().await.unwrap();
-    let mux = Mux::from_secret_stream(
-        SecretStream::new(false, tcp, generate_keypair())
-            .await
-            .unwrap(),
-    );
-    store.replicate(&mux);
     for (key, blocks) in &expected {
-        let report = timeout(Duration::from_secs(30), line(&mut out, "core "))
+        let report = timeout(Duration::from_secs(60), line(&mut out, "core "))
             .await
             .expect("JS read timed out");
         assert_eq!(report, format!("{key} {} {}", blocks.len(), sha256(blocks)));
     }
     assert_eq!(store.open_cores().len(), 3);
+    let _ = swarm.destroy().await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs node and `npm install` in tests/js"]
 async fn rust_reads_a_js_corestore_core() {
     let tmp = tempfile::tempdir().unwrap();
+    let (_testnet, mut tn) = node(&["testnet"]);
+    let port = line(&mut tn, "bootstrap ").await;
     let js = tmp.path().join("js");
-    let (_child, mut out) = node(&["write", js.to_str().unwrap(), "feed"]);
+    let (_child, mut out) = node(&["write", js.to_str().unwrap(), &port, &hex(&TOPIC), "feed"]);
     let key: [u8; 32] = {
         let h = line(&mut out, "key ").await;
         (0..32)
@@ -122,20 +151,12 @@ async fn rust_reads_a_js_corestore_core() {
             .try_into()
             .unwrap()
     };
-    let port = line(&mut out, "port ").await;
+    line(&mut out, "ready").await;
     let store = Corestore::open(&tmp.path().join("rust")).unwrap();
-    let tcp = TcpStream::connect(format!("127.0.0.1:{port}"))
-        .await
-        .unwrap();
-    let mux = Mux::from_secret_stream(
-        SecretStream::new(true, tcp, generate_keypair())
-            .await
-            .unwrap(),
-    );
-    store.replicate(&mux);
+    let swarm = swarm(&port, &store, true).await;
     let core = store.get(GetOptions::key(key)).unwrap();
     assert!(
-        timeout(Duration::from_secs(30), core.update(None))
+        timeout(Duration::from_secs(60), core.update(None))
             .await
             .unwrap()
             .unwrap()
@@ -149,5 +170,5 @@ async fn rust_reads_a_js_corestore_core() {
             .unwrap();
         assert_eq!(b, format!("js-block-{i}").into_bytes());
     }
-    mux.destroy();
+    let _ = swarm.destroy().await;
 }

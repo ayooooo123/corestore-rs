@@ -1,23 +1,37 @@
-// npm corestore side of tests/interop.rs.
+// npm corestore side of tests/interop.rs, over Hyperswarm on a local HyperDHT testnet (UDX).
 //
 // node peer.js keys <dir>
 //   prints JSON: keys derived from a fixed primary key in several namespaces.
-// node peer.js read <dir> <port> <key-hex>...
-//   connects over secret-stream, downloads every listed core, prints
+// node peer.js testnet
+//   runs a 3-node testnet, prints "bootstrap <port>"; exits when stdin closes.
+// node peer.js read <dir> <bootstrap-port> <topic-hex> <key-hex>...
+//   joins the topic as a client, downloads every listed core, prints
 //   "core <key> <length> <sha256>" per core, then exits.
-// node peer.js write <dir> <name>
-//   writes 50 blocks to a named core, prints "key <hex>" and "port <n>", seeds.
-const net = require('net')
+// node peer.js write <dir> <bootstrap-port> <topic-hex> <name>
+//   writes 50 blocks to a named core, prints "key <hex>", announces the topic, prints "ready".
 const fs = require('fs')
 const crypto = require('crypto')
 const Corestore = require('corestore')
-const SecretStream = require('@hyperswarm/secret-stream')
+const Hyperswarm = require('hyperswarm')
+const createTestnet = require('hyperdht/testnet')
 
 const log = (s) => process.stdout.write(s + '\n')
-const [mode, dir, ...args] = process.argv.slice(2)
-fs.rmSync(dir, { recursive: true, force: true })
+const [mode, ...args] = process.argv.slice(2)
+process.stdin.on('end', () => process.exit(0))
+process.stdin.resume()
+
+function swarm(port) {
+  return new Hyperswarm({ bootstrap: [{ host: '127.0.0.1', port: Number(port) }] })
+}
+
+async function testnet() {
+  const t = await createTestnet(3, { host: '127.0.0.1' })
+  log('bootstrap ' + t.bootstrap[0].port)
+}
 
 async function keys() {
+  const [dir] = args
+  fs.rmSync(dir, { recursive: true, force: true })
   const store = new Corestore(dir, { primaryKey: Buffer.alloc(32, 7), unsafe: true })
   await store.ready()
   const out = []
@@ -38,47 +52,47 @@ async function keys() {
   }
   await store.close()
   log(JSON.stringify(out))
+  process.exit(0)
 }
 
 async function read() {
-  const [port, ...keys] = args
+  const [dir, port, topic, ...keys] = args
+  fs.rmSync(dir, { recursive: true, force: true })
   const store = new Corestore(dir)
-  const ss = new SecretStream(true, net.connect(Number(port), '127.0.0.1'))
-  ss.on('error', () => {})
-  store.replicate(ss)
+  const s = swarm(port)
+  s.on('connection', (conn) => store.replicate(conn))
+  s.join(Buffer.from(topic, 'hex'), { server: false, client: true })
   for (const key of keys) {
     const core = store.get({ key: Buffer.from(key, 'hex') })
     await core.ready()
-    await core.update({ wait: true })
+    while (core.length === 0) {
+      await core.update({ wait: true })
+      if (core.length === 0) await new Promise((resolve) => setTimeout(resolve, 200))
+    }
     const hash = crypto.createHash('sha256')
     for (let i = 0; i < core.length; i++) hash.update(await core.get(i))
     log('core ' + key + ' ' + core.length + ' ' + hash.digest('hex'))
   }
-  ss.destroy()
+  await s.destroy()
   await store.close()
   process.exit(0)
 }
 
 async function write() {
-  const [name] = args
+  const [dir, port, topic, name] = args
+  fs.rmSync(dir, { recursive: true, force: true })
   const store = new Corestore(dir)
   const core = store.get({ name })
   await core.ready()
   for (let i = 0; i < 50; i++) await core.append(Buffer.from('js-block-' + i))
   log('key ' + core.key.toString('hex'))
-  const server = net.createServer((socket) => {
-    const ss = new SecretStream(false, socket)
-    store.replicate(ss)
-    ss.on('error', () => {})
-    ss.on('close', async () => {
-      await store.close()
-      process.exit(0)
-    })
-  })
-  server.listen(0, '127.0.0.1', () => log('port ' + server.address().port))
+  const s = swarm(port)
+  s.on('connection', (conn) => store.replicate(conn))
+  await s.join(Buffer.from(topic, 'hex'), { server: true, client: false }).flushed()
+  log('ready')
 }
 
-;({ keys, read, write })[mode]().catch((err) => {
+;({ keys, testnet, read, write })[mode]().catch((err) => {
   log('error ' + err.stack)
   process.exit(1)
 })
