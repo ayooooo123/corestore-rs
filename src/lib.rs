@@ -88,6 +88,8 @@ pub struct GetOptions {
     pub manifest: Option<Manifest>,
     pub encryption_key: Option<[u8; 32]>,
     pub encryption: EncryptionOptions,
+    pub manifest_version: Option<u64>,
+    pub inflight_range: Option<(u32, u32)>,
     /// Open a session that does not keep the core downloading.
     pub inactive: bool,
 }
@@ -126,22 +128,35 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 #[derive(Clone)]
 pub struct Corestore {
     root: Arc<Root>,
+    pub manifest_version: u64,
     ns: [u8; 32],
 }
 
 impl Corestore {
     /// Opens the corestore in `dir`, creating a random primary key the first time.
     pub fn open(dir: &Path) -> Result<Corestore> {
-        Self::open_with(dir, None)
+        Self::open_with(dir, None, false)
     }
 
     /// Opens with a known primary key (JS `primaryKey` with `unsafe: true`).
     pub fn open_with_primary_key(dir: &Path, primary_key: [u8; 32]) -> Result<Corestore> {
-        Self::open_with(dir, Some(primary_key))
+        Self::open_with(dir, Some(primary_key), false)
     }
 
-    fn open_with(dir: &Path, wanted: Option<[u8; 32]>) -> Result<Corestore> {
-        let store = Store::open(dir)?;
+    pub fn open_read_only(dir: &Path) -> Result<Corestore> {
+        Self::open_with(dir, None, true)
+    }
+
+    pub fn read_only(&self) -> bool {
+        self.root.store.read_only()
+    }
+
+    fn open_with(dir: &Path, wanted: Option<[u8; 32]>, read_only: bool) -> Result<Corestore> {
+        let store = if read_only {
+            Store::open_read_only(dir)?
+        } else {
+            Store::open(dir)?
+        };
         let primary_key = match store.get_meta(PRIMARY_KEY)? {
             Some(stored) => {
                 let stored: [u8; 32] = stored[..].try_into().map_err(|_| Error::OtherCorestore)?;
@@ -167,6 +182,7 @@ impl Corestore {
         Ok(Corestore {
             root: Arc::new(root),
             ns: DEFAULT_NAMESPACE,
+            manifest_version: 1,
         })
     }
 
@@ -183,6 +199,7 @@ impl Corestore {
         Corestore {
             root: self.root.clone(),
             ns: namespace_of(&self.ns, name.as_ref()),
+            manifest_version: self.manifest_version,
         }
     }
 
@@ -193,17 +210,41 @@ impl Corestore {
 
     /// Opens (or creates) a core and returns a session on it.
     pub fn get(&self, opts: GetOptions) -> Result<Session> {
+        let alias = opts.name.as_ref().map(|name| {
+            let digest = hash(&[], &[&self.ns, name]);
+            format!(
+                "corestore/alias/{}",
+                digest
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<String>()
+            )
+        });
+        let alias_key = match &alias {
+            Some(alias) => self
+                .root
+                .store
+                .get_meta(alias)?
+                .map(|value| {
+                    <[u8; 32]>::try_from(value.as_ref()).map_err(|_| Error::OtherCorestore)
+                })
+                .transpose()?,
+            None => None,
+        };
         let key_pair = match &opts.name {
             Some(name) => Some(self.create_key_pair(name)),
             None => opts.key_pair.clone(),
         };
         let manifest = opts.manifest.clone().or_else(|| {
-            key_pair
-                .as_ref()
-                .map(|kp| hypercore::verifier::default_signer_manifest(kp.public_key))
+            key_pair.as_ref().map(|kp| {
+                let mut manifest = hypercore::verifier::default_signer_manifest(kp.public_key);
+                manifest.version = opts.manifest_version.unwrap_or(self.manifest_version);
+                manifest
+            })
         });
         let key = opts
             .key
+            .or(alias_key)
             .or_else(|| manifest.as_ref().map(crypto::manifest_hash));
         let dk = match (key, opts.discovery_key) {
             (Some(k), _) => crypto::discovery_key(&k),
@@ -211,6 +252,11 @@ impl Corestore {
             (None, None) => return Err(Error::NoKey),
         };
         if let Some(core) = self.resume(&dk) {
+            if !self.read_only()
+                && let Some(alias) = &alias
+            {
+                self.root.store.put_meta(alias, Some(core.key()))?;
+            }
             return Ok(core.session(!opts.inactive));
         }
         let core_opts = CoreOptions {
@@ -219,12 +265,19 @@ impl Corestore {
             manifest,
             encryption_key: opts.encryption_key,
             encryption: opts.encryption,
-            no_create: key.is_none(),
+            no_create: key.is_none() || self.read_only(),
+            manifest_version: opts.manifest_version.unwrap_or(self.manifest_version),
+            inflight_range: opts.inflight_range,
         };
         let core = match key {
             Some(_) => Core::open(&self.root.store, core_opts)?,
             None => Core::open_by_discovery_key(&self.root.store, &dk, core_opts)?,
         };
+        if !self.read_only()
+            && let Some(alias) = alias
+        {
+            self.root.store.put_meta(&alias, Some(core.key()))?;
+        }
         let core = self.root.register(core);
         Ok(core.session(!opts.inactive))
     }
@@ -248,9 +301,26 @@ impl Corestore {
         Ok(self.root.store.cores()?)
     }
 
+    pub fn storage_infos(
+        &self,
+        discovery_keys: &[[u8; 32]],
+    ) -> Result<Vec<Option<hypercore::Head>>> {
+        discovery_keys
+            .iter()
+            .map(|dk| Core::stored_head(&self.root.store, dk).map_err(Error::from))
+            .collect()
+    }
+
     /// Cores currently open.
     pub fn open_cores(&self) -> Vec<Core> {
         lock(&self.root.cores).values().cloned().collect()
+    }
+
+    pub fn close(&self) {
+        for core in self.open_cores() {
+            core.close();
+        }
+        self.root.store.close();
     }
 
     /// Replicates every open core over `mux`, and opens stored cores on

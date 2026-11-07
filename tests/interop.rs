@@ -106,16 +106,10 @@ async fn js_reads_any_stored_rust_core() {
             core.append(&blocks).await.unwrap();
             expected.push((hex(core.key()), blocks));
         }
+        store.close();
     }
     // Reopened with nothing open: every core opens because JS asks for it.
-    // Background replicator tasks of the first instance may still hold the
-    // database for a moment after it is dropped.
-    let store = loop {
-        match Corestore::open(&tmp.path().join("rust")) {
-            Ok(s) => break s,
-            Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
-        }
-    };
+    let store = Corestore::open(&tmp.path().join("rust")).unwrap();
     let (_testnet, mut tn) = node(&["testnet"]);
     let port = line(&mut tn, "bootstrap ").await;
     let swarm = swarm(&port, &store, false).await;

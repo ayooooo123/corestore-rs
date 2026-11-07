@@ -29,8 +29,10 @@ store.replicate(&mux); // every open core, plus any stored core the remote asks 
   no longer loses its core). The sweep runs only while cores await collection.
 - `purge()` deletes a stored core unless it has active sessions; `list()` lists stored cores.
 
-Not ported: groups and group notifications, `staticify`, `suspend`/`resume`, `audit`, aliases
-(named cores are found by re-deriving their key), and read-only stores.
+- Named aliases are persisted, and `storage_infos` reads stored heads without opening cores.
+  `open_read_only` rejects writes. `close` invalidates existing handles and releases storage.
+
+Not ported: groups and group notifications, `staticify`, `suspend`/`resume`, and `audit`.
 
 ## Tests
 
