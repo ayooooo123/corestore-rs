@@ -92,6 +92,7 @@ pub struct GetOptions {
     pub inflight_range: Option<(u32, u32)>,
     /// Open a session that does not keep the core downloading.
     pub inactive: bool,
+    pub exclusive: bool,
 }
 
 impl GetOptions {
@@ -117,6 +118,37 @@ struct Root {
     muxes: Mutex<Vec<Mux>>,
     watchers: Mutex<Vec<mpsc::UnboundedSender<Core>>>,
     gc: Mutex<HashMap<[u8; 32], u8>>,
+    scopes: Mutex<Vec<Weak<Scope>>>,
+    inflight_range: Mutex<Option<(u32, u32)>>,
+}
+
+#[derive(Default)]
+struct Scope {
+    sessions: Mutex<Option<Vec<hypercore::core::WeakSession>>>,
+}
+
+impl Scope {
+    fn new() -> Self {
+        Self {
+            sessions: Mutex::new(Some(Vec::new())),
+        }
+    }
+
+    fn register(&self, session: &Session) -> Result<()> {
+        let mut sessions = lock(&self.sessions);
+        let sessions = sessions.as_mut().ok_or(CoreError::Closed)?;
+        sessions.retain(|session| session.is_alive());
+        sessions.push(session.downgrade());
+        Ok(())
+    }
+
+    fn close(&self) {
+        if let Some(sessions) = lock(&self.sessions).take() {
+            for session in sessions {
+                session.close();
+            }
+        }
+    }
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -130,6 +162,8 @@ pub struct Corestore {
     root: Arc<Root>,
     pub manifest_version: u64,
     ns: [u8; 32],
+    scope: Arc<Scope>,
+    is_root: bool,
 }
 
 impl Corestore {
@@ -178,10 +212,14 @@ impl Corestore {
             muxes: Mutex::default(),
             watchers: Mutex::default(),
             gc: Mutex::default(),
+            scopes: Mutex::default(),
+            inflight_range: Mutex::default(),
         };
         Ok(Corestore {
             root: Arc::new(root),
             ns: DEFAULT_NAMESPACE,
+            scope: Arc::new(Scope::new()),
+            is_root: true,
             manifest_version: 1,
         })
     }
@@ -196,9 +234,27 @@ impl Corestore {
 
     /// A view in the child namespace `name` (JS `store.namespace(name)`).
     pub fn namespace(&self, name: impl AsRef<[u8]>) -> Corestore {
+        self.child(namespace_of(&self.ns, name.as_ref()))
+    }
+
+    /// Opens an independent scope in the default namespace.
+    pub fn session(&self) -> Corestore {
+        self.child(DEFAULT_NAMESPACE)
+    }
+
+    fn child(&self, ns: [u8; 32]) -> Corestore {
+        let scope = Arc::new(Scope::new());
+        let mut scopes = lock(&self.root.scopes);
+        scopes.retain(|s| s.strong_count() != 0);
+        if self.root.store.is_closed() {
+            scope.close();
+        }
+        scopes.push(Arc::downgrade(&scope));
         Corestore {
             root: self.root.clone(),
-            ns: namespace_of(&self.ns, name.as_ref()),
+            ns,
+            scope,
+            is_root: false,
             manifest_version: self.manifest_version,
         }
     }
@@ -209,7 +265,29 @@ impl Corestore {
     }
 
     /// Opens (or creates) a core and returns a session on it.
-    pub fn get(&self, opts: GetOptions) -> Result<Session> {
+    pub async fn get(&self, opts: GetOptions) -> Result<Session> {
+        let exclusive = opts.exclusive;
+        let session = loop {
+            let session = self.get_inner(opts.clone())?;
+            if !session.core().is_closed() {
+                break session;
+            }
+        };
+        self.scope.register(&session)?;
+        if exclusive {
+            session.acquire_exclusive().await?;
+        }
+        if session.is_closed() {
+            return Err(CoreError::Closed.into());
+        }
+        Ok(session)
+    }
+
+    fn get_inner(&self, opts: GetOptions) -> Result<Session> {
+        if lock(&self.scope.sessions).is_none() || self.root.store.is_closed() {
+            return Err(CoreError::Closed.into());
+        }
+        let store_range = lock(&self.root.inflight_range);
         let alias = opts.name.as_ref().map(|name| {
             let digest = hash(&[], &[&self.ns, name]);
             format!(
@@ -257,6 +335,9 @@ impl Corestore {
             {
                 self.root.store.put_meta(alias, Some(core.key()))?;
             }
+            if let Some(range) = opts.inflight_range.or(*store_range) {
+                core.set_inflight_range(range);
+            }
             return Ok(core.session(!opts.inactive));
         }
         let core_opts = CoreOptions {
@@ -267,7 +348,7 @@ impl Corestore {
             encryption: opts.encryption,
             no_create: key.is_none() || self.read_only(),
             manifest_version: opts.manifest_version.unwrap_or(self.manifest_version),
-            inflight_range: opts.inflight_range,
+            inflight_range: opts.inflight_range.or(*store_range),
         };
         let core = match key {
             Some(_) => Core::open(&self.root.store, core_opts)?,
@@ -284,7 +365,13 @@ impl Corestore {
 
     /// An open core, also reviving one waiting to be garbage collected.
     fn resume(&self, dk: &[u8; 32]) -> Option<Core> {
-        let core = lock(&self.root.cores).get(dk).cloned()?;
+        let core = {
+            let mut cores = lock(&self.root.cores);
+            if cores.get(dk).is_some_and(Core::is_closed) {
+                cores.remove(dk);
+            }
+            cores.get(dk).cloned()?
+        };
         lock(&self.root.gc).remove(dk);
         Some(core)
     }
@@ -316,11 +403,27 @@ impl Corestore {
         lock(&self.root.cores).values().cloned().collect()
     }
 
-    pub fn close(&self) {
+    /// Sets the replication window on all open cores and future opens.
+    pub fn set_inflight_range(&self, range: (u32, u32)) {
+        let mut default = lock(&self.root.inflight_range);
+        *default = Some(range);
         for core in self.open_cores() {
-            core.close();
+            core.set_inflight_range(range);
         }
-        self.root.store.close();
+    }
+
+    pub async fn close(&self) {
+        self.scope.close();
+        if self.is_root {
+            let scopes = lock(&self.root.scopes);
+            for scope in scopes.iter().filter_map(Weak::upgrade) {
+                scope.close();
+            }
+            for core in self.open_cores() {
+                core.close();
+            }
+            self.root.store.close();
+        }
     }
 
     /// Replicates every open core over `mux`, and opens stored cores on
@@ -375,7 +478,9 @@ impl Root {
         let dk = *core.discovery_key();
         let core = {
             let mut cores = lock(&self.cores);
-            if let Some(existing) = cores.get(&dk) {
+            if let Some(existing) = cores.get(&dk)
+                && !existing.is_closed()
+            {
                 return existing.clone();
             }
             cores.insert(dk, core.clone());
@@ -407,13 +512,21 @@ impl Root {
         else {
             return;
         };
+        let range = lock(&self.inflight_range);
         let open = lock(&self.cores).get(&dk).cloned();
         let core = match open {
             Some(c) => {
                 lock(&self.gc).remove(&dk);
                 c
             }
-            None => match Core::open_by_discovery_key(&self.store, &dk, CoreOptions::default()) {
+            None => match Core::open_by_discovery_key(
+                &self.store,
+                &dk,
+                CoreOptions {
+                    inflight_range: *range,
+                    ..Default::default()
+                },
+            ) {
                 Ok(c) => self.register(c),
                 Err(_) => return, // not stored here: the remote open is rejected
             },

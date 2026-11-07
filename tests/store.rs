@@ -33,7 +33,7 @@ async fn keys_match_js_corestore() {
             case["publicKey"].as_str().unwrap(),
             "{case}"
         );
-        let core = view.get(GetOptions::name(name)).unwrap();
+        let core = view.get(GetOptions::name(name)).await.unwrap();
         assert_eq!(hex(core.key()), case["key"].as_str().unwrap(), "{case}");
         assert_eq!(
             hex(core.discovery_key()),
@@ -54,13 +54,13 @@ async fn reopening_keeps_the_primary_key_and_cores() {
     let dir = tempfile::tempdir().unwrap();
     let (pk, key) = {
         let store = Corestore::open(dir.path()).unwrap();
-        let core = store.get(GetOptions::name("x")).unwrap();
+        let core = store.get(GetOptions::name("x")).await.unwrap();
         core.append(&[b"hi".as_slice()]).await.unwrap();
         (*store.primary_key(), *core.key())
     };
     let store = Corestore::open(dir.path()).unwrap();
     assert_eq!(store.primary_key(), &pk);
-    let core = store.get(GetOptions::name("x")).unwrap();
+    let core = store.get(GetOptions::name("x")).await.unwrap();
     assert_eq!(core.key(), &key);
     assert_eq!(core.length(), 1);
     let by_dk = store
@@ -68,6 +68,7 @@ async fn reopening_keeps_the_primary_key_and_cores() {
             discovery_key: Some(*core.discovery_key()),
             ..Default::default()
         })
+        .await
         .unwrap();
     assert_eq!(
         by_dk.key(),
@@ -82,9 +83,13 @@ async fn watch_reports_new_cores() {
     let dir = tempfile::tempdir().unwrap();
     let store = Corestore::open(dir.path()).unwrap();
     let mut watch = store.watch();
-    let a = store.get(GetOptions::name("a")).unwrap();
-    let _again = store.get(GetOptions::name("a")).unwrap();
-    let b = store.namespace("ns").get(GetOptions::name("a")).unwrap();
+    let a = store.get(GetOptions::name("a")).await.unwrap();
+    let _again = store.get(GetOptions::name("a")).await.unwrap();
+    let b = store
+        .namespace("ns")
+        .get(GetOptions::name("a"))
+        .await
+        .unwrap();
     assert_eq!(watch.recv().await.unwrap().key(), a.key());
     assert_eq!(watch.recv().await.unwrap().key(), b.key());
     assert!(
@@ -123,9 +128,9 @@ fn link() -> (Mux, Mux) {
 async fn idle_cores_are_collected_unless_used_again() {
     let dir = tempfile::tempdir().unwrap();
     let store = Corestore::open(dir.path()).unwrap();
-    let session = store.get(GetOptions::name("gone")).unwrap();
+    let session = store.get(GetOptions::name("gone")).await.unwrap();
     drop(session);
-    let kept = store.get(GetOptions::name("kept")).unwrap();
+    let kept = store.get(GetOptions::name("kept")).await.unwrap();
     let dk = *kept.discovery_key();
     drop(kept);
     assert_eq!(store.open_cores().len(), 2);
@@ -136,6 +141,7 @@ async fn idle_cores_are_collected_unless_used_again() {
             discovery_key: Some(dk),
             ..Default::default()
         })
+        .await
         .unwrap();
     tokio::time::sleep(Duration::from_secs(10)).await;
     let open: Vec<_> = store
@@ -160,7 +166,7 @@ async fn a_peer_gets_any_stored_core_on_demand() {
         let writer = Corestore::open(da.path()).unwrap();
         let mut keys = vec![];
         for name in ["one", "two", "three"] {
-            let core = writer.get(GetOptions::name(name)).unwrap();
+            let core = writer.get(GetOptions::name(name)).await.unwrap();
             core.append(&[name.as_bytes()]).await.unwrap();
             keys.push(*core.key());
         }
@@ -174,7 +180,7 @@ async fn a_peer_gets_any_stored_core_on_demand() {
     writer.replicate(&ma);
     reader.replicate(&mb);
     for (key, name) in keys.iter().zip(["one", "two", "three"]) {
-        let core = reader.get(GetOptions::key(*key)).unwrap();
+        let core = reader.get(GetOptions::key(*key)).await.unwrap();
         let block = timeout(Duration::from_secs(10), core.get(0, Get::default()))
             .await
             .unwrap()

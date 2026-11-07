@@ -10,7 +10,7 @@ use corestore::{Corestore, GetOptions};
 # async fn demo(mux: protomux::Mux) -> Result<(), Box<dyn std::error::Error>> {
 let store = Corestore::open("./store".as_ref())?;
 let channel = store.namespace("channel-1");
-let feed = channel.get(GetOptions::name("feed"))?; // same key as JS for the same primary key
+let feed = channel.get(GetOptions::name("feed")).await?; // same key as JS for the same primary key
 feed.append(&[b"first".as_slice()]).await?;
 store.replicate(&mux); // every open core, plus any stored core the remote asks for
 # Ok(()) }
@@ -23,11 +23,13 @@ store.replicate(&mux); // every open core, plus any stored core the remote asks 
   asks for a discovery key that is stored here but not open, the core is opened and attached to
   that connection; unknown keys are rejected.
 - **Watch**: `watch()` yields each core as it opens (JS `store.watch`).
-- **Garbage collection**: a core with no sessions and no peers gets a strike every 2 s and closes on
-  the fourth, as in JS. A struck core that gets a session or a peer again is spared, which is the
-  fix in the corestore fork PearTube runs (a peer opening a channel on an already attached stream
-  no longer loses its core). The sweep runs only while cores await collection.
+- **Sessions**: `session()` opens an independent default-namespace scope; `namespace()` opens an
+  independent scope in the derived namespace. Closing a scope closes only its sessions. Closing
+  the root store closes all scopes and storage. Set `GetOptions::exclusive` to await an exclusive
+  lease; leases can be moved between sessions on the same physical core.
 - `purge()` deletes a stored core unless it has active sessions; `list()` lists stored cores.
+- `set_inflight_range((min, max))` changes open cores and the default for later opens; an
+  explicit `GetOptions::inflight_range` selects the window for that open.
 
 - Named aliases are persisted, and `storage_infos` reads stored heads without opening cores.
   `open_read_only` rejects writes. `close` invalidates existing handles and releases storage.

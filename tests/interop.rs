@@ -99,14 +99,18 @@ async fn js_reads_any_stored_rust_core() {
     {
         let store = Corestore::open(&tmp.path().join("rust")).unwrap();
         for (i, name) in ["main", "video-blobs", "comments"].into_iter().enumerate() {
-            let core = store.namespace("app").get(GetOptions::name(name)).unwrap();
+            let core = store
+                .namespace("app")
+                .get(GetOptions::name(name))
+                .await
+                .unwrap();
             let blocks: Vec<Vec<u8>> = (0..(10 + i * 7))
                 .map(|j| format!("{name}-{j}").into_bytes())
                 .collect();
             core.append(&blocks).await.unwrap();
             expected.push((hex(core.key()), blocks));
         }
-        store.close();
+        store.close().await;
     }
     // Reopened with nothing open: every core opens because JS asks for it.
     let store = Corestore::open(&tmp.path().join("rust")).unwrap();
@@ -148,7 +152,7 @@ async fn rust_reads_a_js_corestore_core() {
     line(&mut out, "ready").await;
     let store = Corestore::open(&tmp.path().join("rust")).unwrap();
     let swarm = swarm(&port, &store, true).await;
-    let core = store.get(GetOptions::key(key)).unwrap();
+    let core = store.get(GetOptions::key(key)).await.unwrap();
     assert!(
         timeout(Duration::from_secs(60), core.update(None))
             .await
