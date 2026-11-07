@@ -10,14 +10,13 @@ use blake2b_simd::Params;
 use hypercore::crypto::{self, KeyPair};
 use hypercore::encryption::EncryptionOptions;
 use hypercore::replicator::PROTOCOL;
-use hypercore::storage::{StorageError, Store};
+use hypercore::storage::{Alias, StorageError, Store};
 use hypercore::{Core, CoreError, CoreOptions, Manifest, Session};
 use protomux::Mux;
 use tokio::sync::mpsc;
 
 /// JS `DEFAULT_NAMESPACE`: 32 zero bytes.
 pub const DEFAULT_NAMESPACE: [u8; 32] = [0; 32];
-const PRIMARY_KEY: &str = "corestore/primary-key";
 /// JS strikes an idle core every 2 s and closes it on the fourth strike.
 const GC_INTERVAL: Duration = Duration::from_secs(2);
 const GC_STRIKES: u8 = 4;
@@ -58,6 +57,38 @@ impl From<StorageError> for Error {
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+/// One group's update log, as rows under its topic.
+///
+/// JS hands back a stream of updates; nothing in this stack consumes that
+/// stream, so this reads the rows on demand instead of running a timer.
+pub struct GroupNotify {
+    store: Store,
+    group: u64,
+}
+
+impl GroupNotify {
+    /// Core keys updated at or after `since` (epoch milliseconds), newest first.
+    pub fn updates(&self, since: u64) -> Result<Vec<[u8; 32]>> {
+        Ok(self
+            .store
+            .group_updates(self.group, since)?
+            .into_iter()
+            .map(|(_, key)| key)
+            .collect())
+    }
+
+    /// Records that `key` changed now, as hypercore does after an append.
+    pub fn put(&self, key: &[u8; 32]) -> Result<()> {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        self.store
+            .put_group_update(self.group, timestamp, 0, key)?;
+        Ok(())
+    }
+}
 
 fn hash(key: &[u8], parts: &[&[u8]]) -> [u8; 32] {
     let mut h = Params::new().hash_length(32).key(key).to_state();
@@ -191,19 +222,16 @@ impl Corestore {
         } else {
             Store::open(dir)?
         };
-        let primary_key = match store.get_meta(PRIMARY_KEY)? {
+        // The primary key is the store head's seed (`_getOrSetSeed`).
+        let primary_key = match store.seed()? {
             Some(stored) => {
-                let stored: [u8; 32] = stored[..].try_into().map_err(|_| Error::OtherCorestore)?;
                 if wanted.is_some_and(|w| w != stored) {
                     return Err(Error::OtherCorestore);
                 }
                 stored
             }
-            None => {
-                let pk = wanted.unwrap_or_else(rand::random);
-                store.put_meta(PRIMARY_KEY, Some(&pk))?;
-                pk
-            }
+            None if read_only => wanted.unwrap_or_else(rand::random),
+            None => store.set_seed(wanted.unwrap_or_else(rand::random))?,
         };
         let root = Root {
             store,
@@ -235,6 +263,42 @@ impl Corestore {
     /// A view in the child namespace `name` (JS `store.namespace(name)`).
     pub fn namespace(&self, name: impl AsRef<[u8]>) -> Corestore {
         self.child(namespace_of(&self.ns, name.as_ref()))
+    }
+
+    /// A view of an already derived namespace, byte for byte.
+    pub fn namespace_raw(&self, namespace: [u8; 32]) -> Corestore {
+        self.child(namespace)
+    }
+
+    /// Points `namespace`/`name` at the core with `key`.
+    pub fn set_alias(
+        &self,
+        namespace: [u8; 32],
+        name: impl AsRef<[u8]>,
+        key: [u8; 32],
+    ) -> Result<()> {
+        let alias = Alias {
+            namespace,
+            name: String::from_utf8_lossy(name.as_ref()).into_owned(),
+        };
+        self.root
+            .store
+            .set_alias(&alias, &crypto::discovery_key(&key))?;
+        Ok(())
+    }
+
+    /// `store.createGroup(topic)`: the group pointer for a topic, allocated once.
+    pub fn create_group(&self, topic: &[u8; 32]) -> Result<u64> {
+        Ok(self.root.store.create_group(topic)?)
+    }
+
+    /// A reader for one group's update log (JS `store.notifyGroup`).
+    pub fn notify_group(&self, topic: [u8; 32]) -> Result<GroupNotify> {
+        let group = self.root.store.create_group(&topic)?;
+        Ok(GroupNotify {
+            store: self.root.store.clone(),
+            group,
+        })
     }
 
     /// Opens an independent scope in the default namespace.
@@ -288,25 +352,13 @@ impl Corestore {
             return Err(CoreError::Closed.into());
         }
         let store_range = lock(&self.root.inflight_range);
-        let alias = opts.name.as_ref().map(|name| {
-            let digest = hash(&[], &[&self.ns, name]);
-            format!(
-                "corestore/alias/{}",
-                digest
-                    .iter()
-                    .map(|b| format!("{b:02x}"))
-                    .collect::<String>()
-            )
+        let alias = opts.name.as_ref().map(|name| Alias {
+            namespace: self.ns,
+            name: String::from_utf8_lossy(name).into_owned(),
         });
-        let alias_key = match &alias {
-            Some(alias) => self
-                .root
-                .store
-                .get_meta(alias)?
-                .map(|value| {
-                    <[u8; 32]>::try_from(value.as_ref()).map_err(|_| Error::OtherCorestore)
-                })
-                .transpose()?,
+        // JS `getAlias` returns a discovery key.
+        let alias_discovery_key = match &alias {
+            Some(alias) => self.root.store.get_alias(alias)?,
             None => None,
         };
         let key_pair = match &opts.name {
@@ -322,18 +374,18 @@ impl Corestore {
         });
         let key = opts
             .key
-            .or(alias_key)
             .or_else(|| manifest.as_ref().map(crypto::manifest_hash));
-        let dk = match (key, opts.discovery_key) {
-            (Some(k), _) => crypto::discovery_key(&k),
-            (None, Some(dk)) => dk,
-            (None, None) => return Err(Error::NoKey),
+        let dk = match (key, alias_discovery_key, opts.discovery_key) {
+            (_, Some(dk), _) => dk,
+            (Some(k), None, _) => crypto::discovery_key(&k),
+            (None, None, Some(dk)) => dk,
+            (None, None, None) => return Err(Error::NoKey),
         };
         if let Some(core) = self.resume(&dk) {
             if !self.read_only()
                 && let Some(alias) = &alias
             {
-                self.root.store.put_meta(alias, Some(core.key()))?;
+                self.root.store.set_alias(alias, core.discovery_key())?;
             }
             if let Some(range) = opts.inflight_range.or(*store_range) {
                 core.set_inflight_range(range);
@@ -351,13 +403,13 @@ impl Corestore {
             inflight_range: opts.inflight_range.or(*store_range),
         };
         let core = match key {
-            Some(_) => Core::open(&self.root.store, core_opts)?,
-            None => Core::open_by_discovery_key(&self.root.store, &dk, core_opts)?,
+            Some(_) if alias_discovery_key.is_none() => Core::open(&self.root.store, core_opts)?,
+            _ => Core::open_by_discovery_key(&self.root.store, &dk, core_opts)?,
         };
         if !self.read_only()
             && let Some(alias) = alias
         {
-            self.root.store.put_meta(&alias, Some(core.key()))?;
+            self.root.store.set_alias(&alias, core.discovery_key())?;
         }
         let core = self.root.register(core);
         Ok(core.session(!opts.inactive))

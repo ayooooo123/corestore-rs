@@ -31,6 +31,11 @@ store.replicate(&mux); // every open core, plus any stored core the remote asks 
 - `set_inflight_range((min, max))` changes open cores and the default for later opens; an
   explicit `GetOptions::inflight_range` selects the window for that open.
 
+- **Storage**: everything lives in hypercore-storage's own rows, so the npm corestore 7.16.1 can
+  open the same directory: the primary key is the store head's `seed`, `namespace`/`name` aliases
+  are the alias rows that point at a discovery key, `list()` is the discovery-key index, and
+  `create_group`/`notify_group` use the group and group-update rows. `set_alias` and
+  `namespace_raw` write and read those rows directly.
 - Named aliases are persisted, and `storage_infos` reads stored heads without opening cores.
   `open_read_only` rejects writes. `close` invalidates existing handles and releases storage.
 
