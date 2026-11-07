@@ -416,15 +416,7 @@ impl Corestore {
 
     /// An open core, also reviving one waiting to be garbage collected.
     fn resume(&self, dk: &[u8; 32]) -> Option<Core> {
-        let core = {
-            let mut cores = lock(&self.root.cores);
-            if cores.get(dk).is_some_and(Core::is_closed) {
-                cores.remove(dk);
-            }
-            cores.get(dk).cloned()?
-        };
-        lock(&self.root.gc).remove(dk);
-        Some(core)
+        self.root.resume(dk)
     }
 
     /// Cores opened from now on, as they open (JS `store.watch`).
@@ -525,6 +517,19 @@ impl Corestore {
 }
 
 impl Root {
+    /// An open core, dropping one that has closed since it was registered.
+    fn resume(&self, dk: &[u8; 32]) -> Option<Core> {
+        let core = {
+            let mut cores = lock(&self.cores);
+            if cores.get(dk).is_some_and(Core::is_closed) {
+                cores.remove(dk);
+            }
+            cores.get(dk).cloned()?
+        };
+        lock(&self.gc).remove(dk);
+        Some(core)
+    }
+
     fn register(self: &Arc<Self>, core: Core) -> Core {
         let dk = *core.discovery_key();
         let core = {
@@ -564,12 +569,8 @@ impl Root {
             return;
         };
         let range = lock(&self.inflight_range);
-        let open = lock(&self.cores).get(&dk).cloned();
-        let core = match open {
-            Some(c) => {
-                lock(&self.gc).remove(&dk);
-                c
-            }
+        let core = match self.resume(&dk) {
+            Some(c) => c,
             None => match Core::open_by_discovery_key(
                 &self.store,
                 &dk,

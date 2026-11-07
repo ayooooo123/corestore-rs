@@ -170,3 +170,95 @@ async fn rust_reads_a_js_corestore_core() {
     }
     let _ = swarm.destroy().await;
 }
+
+fn link() -> (Mux, Mux) {
+    let ((ar, aw), (br, bw)) = protomux::memory::duplex(1024);
+    let handshake_hash = Some([3u8; 64]);
+    (
+        Mux::new(
+            ar,
+            aw,
+            protomux::StreamInfo {
+                is_initiator: true,
+                handshake_hash,
+                remote_public_key: None,
+            },
+        ),
+        Mux::new(
+            br,
+            bw,
+            protomux::StreamInfo {
+                is_initiator: false,
+                handshake_hash,
+                remote_public_key: None,
+            },
+        ),
+    )
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs node and `npm install` in tests/js"]
+async fn js_reads_a_stored_core_closed_here() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = Corestore::open(&tmp.path().join("a")).unwrap();
+    let c = Corestore::open(&tmp.path().join("c")).unwrap();
+    let blocks: Vec<Vec<u8>> = (0..50).map(|i| format!("block-{i}").into_bytes()).collect();
+    let writer = c.get(GetOptions::name("writer")).await.unwrap();
+    writer.append(&blocks).await.unwrap();
+    let key = *writer.key();
+
+    // a downloads the core from c and closes its session.
+    let (ma, mc) = link();
+    a.replicate(&ma);
+    c.replicate(&mc);
+    let fetched = a.get(GetOptions::key(key)).await.unwrap();
+    for i in 0..blocks.len() as u64 {
+        fetched.get(i, Get::default()).await.unwrap().unwrap();
+    }
+    // An inactive session keeps the core in the store, so this pins the state
+    // instead of racing the gc sweep: stored, closed, and listed.
+    let pinned = a
+        .get(GetOptions {
+            key: Some(key),
+            inactive: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    drop(fetched);
+    a.open_cores()
+        .into_iter()
+        .find(|core| core.key() == &key)
+        .unwrap()
+        .close();
+    ma.destroy();
+    mc.destroy();
+    c.close().await;
+    assert!(
+        a.open_cores()
+            .iter()
+            .any(|core| core.key() == &key && core.is_closed())
+    );
+
+    // JS is the third peer: it reaches a over Hyperswarm and wants the core.
+    let (_testnet, mut tn) = node(&["testnet"]);
+    let port = line(&mut tn, "bootstrap ").await;
+    let swarm = swarm(&port, &a, false).await;
+    let js = tmp.path().join("js");
+    let (_child, mut out) = node(&[
+        "read",
+        js.to_str().unwrap(),
+        &port,
+        &hex(&TOPIC),
+        &hex(&key),
+    ]);
+    let report = timeout(Duration::from_secs(60), line(&mut out, "core "))
+        .await
+        .expect("JS read timed out");
+    assert_eq!(
+        report,
+        format!("{} {} {}", hex(&key), blocks.len(), sha256(&blocks))
+    );
+    let _ = swarm.destroy().await;
+    drop(pinned);
+}

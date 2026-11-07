@@ -194,3 +194,61 @@ async fn a_peer_gets_any_stored_core_on_demand() {
         "each core was opened on demand"
     );
 }
+
+#[tokio::test]
+async fn a_stored_core_closed_here_still_serves_a_third_peer() {
+    let (da, db, dc) = (
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+    );
+    let a = Corestore::open(da.path()).unwrap();
+    let b = Corestore::open(db.path()).unwrap();
+    let key = {
+        let c = Corestore::open(dc.path()).unwrap();
+        let writer = c.get(GetOptions::name("writer")).await.unwrap();
+        writer.append(&[b"hello".as_slice()]).await.unwrap();
+        let key = *writer.key();
+        // a fetches the block, then closes its session and the connection.
+        let (ma, mc) = link();
+        a.replicate(&ma);
+        c.replicate(&mc);
+        let fetched = a.get(GetOptions::key(key)).await.unwrap();
+        let block = timeout(Duration::from_secs(10), fetched.get(0, Get::default()))
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(&block[..], b"hello");
+        drop(fetched);
+        ma.destroy();
+        mc.destroy();
+        c.close().await;
+        key
+    };
+    assert!(
+        a.open_cores()
+            .iter()
+            .any(|core| core.key() == &key && core.is_closed()),
+        "a has the core stored but closed"
+    );
+
+    // b reaches a over a fresh connection and wants the same core.
+    let (ma, mb) = link();
+    a.replicate(&ma);
+    b.replicate(&mb);
+    let view = b.get(GetOptions::key(key)).await.unwrap();
+    let block = timeout(Duration::from_secs(10), view.get(0, Get::default()))
+        .await
+        .expect("a stored core closed in this process must pair on demand")
+        .unwrap()
+        .unwrap();
+    assert_eq!(&block[..], b"hello");
+    let served = a.open_cores();
+    assert!(
+        served
+            .iter()
+            .any(|core| core.key() == &key && !core.is_idle()),
+        "the reopened core stays open while b uses it"
+    );
+}
