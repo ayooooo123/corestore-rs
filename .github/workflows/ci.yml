@@ -34,6 +34,14 @@ jobs:
         with:
           repository: ${{ github.repository_owner }}/peeroxide
           path: peeroxide
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/hypercore-storage-rs
+          path: hypercore-storage-rs
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/hyperschema-rs
+          path: hyperschema-rs
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
