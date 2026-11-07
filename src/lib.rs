@@ -11,7 +11,7 @@ use hypercore::crypto::{self, KeyPair};
 use hypercore::encryption::EncryptionOptions;
 use hypercore::replicator::PROTOCOL;
 use hypercore::storage::{Alias, StorageError, Store};
-use hypercore::{Core, CoreError, CoreOptions, Manifest, Session};
+use hypercore::{Core, CoreError, CoreOptions, GroupUpdate, Manifest, Session};
 use protomux::Mux;
 use tokio::sync::mpsc;
 
@@ -58,13 +58,14 @@ impl From<StorageError> for Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-/// One group's update log, as rows under its topic.
-///
-/// JS hands back a stream of updates; nothing in this stack consumes that
-/// stream, so this reads the rows on demand instead of running a timer.
+/// One group's update log: the rows under its topic, and the live updates
+/// cores in the group report as they commit (JS `notifyGroup`'s handle).
 pub struct GroupNotify {
     store: Store,
     group: u64,
+    topic: [u8; 32],
+    root: Weak<Root>,
+    updates: mpsc::UnboundedReceiver<GroupUpdate>,
 }
 
 impl GroupNotify {
@@ -74,18 +75,28 @@ impl GroupNotify {
             .store
             .group_updates(self.group, since)?
             .into_iter()
-            .map(|(_, key)| key)
+            .map(|row| row.key)
             .collect())
     }
 
-    /// Records that `key` changed now, as hypercore does after an append.
-    pub fn put(&self, key: &[u8; 32]) -> Result<()> {
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
-        self.store.put_group_update(self.group, timestamp, 0, key)?;
-        Ok(())
+    /// The next member head committed in this group (JS handle's `update`).
+    pub async fn next(&mut self) -> Option<GroupUpdate> {
+        self.updates.recv().await
+    }
+}
+
+impl Drop for GroupNotify {
+    fn drop(&mut self) {
+        if let Some(root) = self.root.upgrade() {
+            let mut notifiers = lock(&root.group_notifiers);
+            let empty = notifiers.get_mut(&self.topic).is_some_and(|handles| {
+                handles.retain(|tx| !tx.is_closed());
+                handles.is_empty()
+            });
+            if empty {
+                notifiers.remove(&self.topic);
+            }
+        }
     }
 }
 
@@ -120,6 +131,8 @@ pub struct GetOptions {
     pub encryption: EncryptionOptions,
     pub manifest_version: Option<u64>,
     pub inflight_range: Option<(u32, u32)>,
+    /// Join this topic's group (`core.setGroup` on open).
+    pub group: Option<[u8; 32]>,
     /// Open a session that does not keep the core downloading.
     pub inactive: bool,
     pub exclusive: bool,
@@ -150,6 +163,8 @@ struct Root {
     gc: Mutex<HashMap<[u8; 32], u8>>,
     scopes: Mutex<Vec<Weak<Scope>>>,
     inflight_range: Mutex<Option<(u32, u32)>>,
+    /// `_groupNotifiers`: one list of live handles per group topic.
+    group_notifiers: Mutex<HashMap<[u8; 32], Vec<mpsc::UnboundedSender<GroupUpdate>>>>,
 }
 
 #[derive(Default)]
@@ -241,6 +256,7 @@ impl Corestore {
             gc: Mutex::default(),
             scopes: Mutex::default(),
             inflight_range: Mutex::default(),
+            group_notifiers: Mutex::default(),
         };
         Ok(Corestore {
             root: Arc::new(root),
@@ -296,12 +312,21 @@ impl Corestore {
         Ok(self.root.store.create_group(topic)?)
     }
 
-    /// A reader for one group's update log (JS `store.notifyGroup`).
+    /// `store.notifyGroup(topic)`: the group's log plus its live updates. The
+    /// group is allocated if nothing created it yet (JS's `setGroup` does).
     pub fn notify_group(&self, topic: [u8; 32]) -> Result<GroupNotify> {
         let group = self.root.store.create_group(&topic)?;
+        let (tx, rx) = mpsc::unbounded_channel();
+        lock(&self.root.group_notifiers)
+            .entry(topic)
+            .or_default()
+            .push(tx);
         Ok(GroupNotify {
             store: self.root.store.clone(),
             group,
+            topic,
+            root: Arc::downgrade(&self.root),
+            updates: rx,
         })
     }
 
@@ -405,6 +430,7 @@ impl Corestore {
             no_create: key.is_none() || self.read_only(),
             manifest_version: opts.manifest_version.unwrap_or(self.manifest_version),
             inflight_range: opts.inflight_range.or(*store_range),
+            group: opts.group,
         };
         let core = match key {
             Some(_) if alias_discovery_key.is_none() => Core::open(&self.root.store, core_opts)?,
@@ -434,6 +460,11 @@ impl Corestore {
     /// Discovery keys of every stored core.
     pub fn list(&self) -> Result<Vec<[u8; 32]>> {
         Ok(self.root.store.cores()?)
+    }
+
+    /// The underlying store (JS `store.storage`).
+    pub fn storage(&self) -> &Store {
+        &self.root.store
     }
 
     pub fn storage_infos(
@@ -553,6 +584,12 @@ impl Root {
                 root.strike(*c.discovery_key());
             }
         });
+        let notifiers = Arc::downgrade(self);
+        core.set_group_update_hook(move |topic, update| {
+            if let Some(root) = notifiers.upgrade() {
+                root.on_group_active(topic, update);
+            }
+        });
         lock(&self.watchers).retain(|w| w.send(core.clone()).is_ok());
         let muxes: Vec<Mux> = lock(&self.muxes)
             .iter()
@@ -563,6 +600,18 @@ impl Root {
             core.replicate(&mux);
         }
         core
+    }
+
+    /// `_onGroupActive`: fan one member's new head out to the group's handles.
+    fn on_group_active(self: &Arc<Self>, topic: [u8; 32], update: GroupUpdate) {
+        let mut notifiers = lock(&self.group_notifiers);
+        let Some(handles) = notifiers.get_mut(&topic) else {
+            return;
+        };
+        handles.retain(|tx| tx.send(update).is_ok());
+        if handles.is_empty() {
+            notifiers.remove(&topic);
+        }
     }
 
     fn on_pair_request(self: &Arc<Self>, mux: &Mux, req: protomux::PairRequest) {
