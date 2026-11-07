@@ -255,6 +255,11 @@ impl Corestore {
         &self.root.primary_key
     }
 
+    /// The engine underneath, for storage maintenance (`flush`, `compact`) and diagnostics.
+    pub fn store(&self) -> &Store {
+        &self.root.store
+    }
+
     pub fn namespace_key(&self) -> &[u8; 32] {
         &self.ns
     }
