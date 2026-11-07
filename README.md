@@ -26,7 +26,9 @@ store.replicate(&mux); // every open core, plus any stored core the remote asks 
 - **Sessions**: `session()` opens an independent default-namespace scope; `namespace()` opens an
   independent scope in the derived namespace. Closing a scope closes only its sessions. Closing
   the root store closes all scopes and storage. Set `GetOptions::exclusive` to await an exclusive
-  lease; leases can be moved between sessions on the same physical core.
+  lease; leases can be moved between sessions on the same physical core. Reopening a closed core
+  waits for its previous replication actor to detach, so that actor cannot unpair the replacement.
+  Garbage collection likewise finishes teardown before removing that physical generation.
 - `purge()` deletes a stored core unless it has active sessions; `list()` lists stored cores.
 - `set_inflight_range((min, max))` changes open cores and the default for later opens; an
   explicit `GetOptions::inflight_range` selects the window for that open.

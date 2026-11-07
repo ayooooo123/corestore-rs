@@ -361,7 +361,7 @@ impl Corestore {
     pub async fn get(&self, opts: GetOptions) -> Result<Session> {
         let exclusive = opts.exclusive;
         let session = loop {
-            let session = self.get_inner(opts.clone())?;
+            let session = self.get_inner(opts.clone()).await?;
             if !session.core().is_closed() {
                 break session;
             }
@@ -376,11 +376,10 @@ impl Corestore {
         Ok(session)
     }
 
-    fn get_inner(&self, opts: GetOptions) -> Result<Session> {
+    async fn get_inner(&self, opts: GetOptions) -> Result<Session> {
         if lock(&self.scope.sessions).is_none() || self.root.store.is_closed() {
             return Err(CoreError::Closed.into());
         }
-        let store_range = lock(&self.root.inflight_range);
         let alias = opts.name.as_ref().map(|name| Alias {
             namespace: self.ns,
             name: String::from_utf8_lossy(name).into_owned(),
@@ -410,7 +409,9 @@ impl Corestore {
             (None, None, Some(dk)) => dk,
             (None, None, None) => return Err(Error::NoKey),
         };
-        if let Some(core) = self.resume(&dk) {
+        let resumed = self.resume(&dk).await;
+        let store_range = lock(&self.root.inflight_range);
+        if let Some(core) = resumed {
             if !self.read_only()
                 && let Some(alias) = &alias
             {
@@ -446,8 +447,8 @@ impl Corestore {
     }
 
     /// An open core, also reviving one waiting to be garbage collected.
-    fn resume(&self, dk: &[u8; 32]) -> Option<Core> {
-        self.root.resume(dk)
+    async fn resume(&self, dk: &[u8; 32]) -> Option<Core> {
+        self.root.resume(dk).await
     }
 
     /// Cores opened from now on, as they open (JS `store.watch`).
@@ -522,14 +523,14 @@ impl Corestore {
         tokio::spawn(async move {
             while let Some(req) = requests.recv().await {
                 let Some(root) = root.upgrade() else { break };
-                root.on_pair_request(&mux, req);
+                root.on_pair_request(&mux, req).await;
             }
         });
     }
 
     /// Deletes a stored core unless something still uses it (JS `store.purge`).
     pub async fn purge(&self, discovery_key: &[u8; 32]) -> Result<bool> {
-        let core = match self.resume(discovery_key) {
+        let core = match self.resume(discovery_key).await {
             Some(c) => c,
             None => match Core::open_by_discovery_key(
                 &self.root.store,
@@ -544,35 +545,51 @@ impl Corestore {
         if core.active_session_count() > 0 {
             return Ok(false);
         }
-        lock(&self.root.cores).remove(discovery_key);
-        lock(&self.root.gc).remove(discovery_key);
         core.close();
+        core.replication_closed().await;
+        {
+            let mut gc = lock(&self.root.gc);
+            let mut cores = lock(&self.root.cores);
+            if cores
+                .get(discovery_key)
+                .is_some_and(|current| current.same_instance(&core))
+            {
+                cores.remove(discovery_key);
+                gc.remove(discovery_key);
+            }
+        }
         core.purge().await?;
         Ok(true)
     }
 }
 
 impl Root {
-    /// An open core, dropping one that has closed since it was registered.
-    fn resume(&self, dk: &[u8; 32]) -> Option<Core> {
-        let core = {
-            let mut cores = lock(&self.cores);
-            if cores.get(dk).is_some_and(Core::is_closed) {
-                cores.remove(dk);
+    /// Reopen only after the previous actor has released this discovery key's mux channels.
+    async fn resume(&self, dk: &[u8; 32]) -> Option<Core> {
+        loop {
+            let core = lock(&self.cores).get(dk).cloned()?;
+            if !core.is_closed() {
+                lock(&self.gc).remove(dk);
+                return Some(core);
             }
-            cores.get(dk).cloned()?
-        };
-        lock(&self.gc).remove(dk);
-        Some(core)
+            core.replication_closed().await;
+            let mut gc = lock(&self.gc);
+            let mut cores = lock(&self.cores);
+            if cores
+                .get(dk)
+                .is_some_and(|current| current.same_instance(&core))
+            {
+                cores.remove(dk);
+                gc.remove(dk);
+            }
+        }
     }
 
     fn register(self: &Arc<Self>, core: Core) -> Core {
         let dk = *core.discovery_key();
         let core = {
             let mut cores = lock(&self.cores);
-            if let Some(existing) = cores.get(&dk)
-                && !existing.is_closed()
-            {
+            if let Some(existing) = cores.get(&dk) {
                 return existing.clone();
             }
             cores.insert(dk, core.clone());
@@ -614,7 +631,7 @@ impl Root {
         }
     }
 
-    fn on_pair_request(self: &Arc<Self>, mux: &Mux, req: protomux::PairRequest) {
+    async fn on_pair_request(self: &Arc<Self>, mux: &Mux, req: protomux::PairRequest) {
         let Some(dk) = req
             .id
             .as_deref()
@@ -622,20 +639,28 @@ impl Root {
         else {
             return;
         };
-        let range = lock(&self.inflight_range);
-        let core = match self.resume(&dk) {
-            Some(c) => c,
-            None => match Core::open_by_discovery_key(
-                &self.store,
-                &dk,
-                CoreOptions {
-                    inflight_range: *range,
-                    ..Default::default()
-                },
-            ) {
-                Ok(c) => self.register(c),
-                Err(_) => return, // not stored here: the remote open is rejected
-            },
+        let core = loop {
+            let resumed = self.resume(&dk).await;
+            let core = {
+                let range = lock(&self.inflight_range);
+                match resumed {
+                    Some(c) => c,
+                    None => match Core::open_by_discovery_key(
+                        &self.store,
+                        &dk,
+                        CoreOptions {
+                            inflight_range: *range,
+                            ..Default::default()
+                        },
+                    ) {
+                        Ok(c) => self.register(c),
+                        Err(_) => return, // not stored here: the remote open is rejected
+                    },
+                }
+            };
+            if !core.is_closed() {
+                break core;
+            }
         };
         core.replicate_paired(mux, req);
     }
@@ -658,25 +683,40 @@ async fn sweep(root: Weak<Root>) {
     loop {
         tokio::time::sleep(GC_INTERVAL).await;
         let Some(root) = root.upgrade() else { return };
-        let mut gc = lock(&root.gc);
-        let mut cores = lock(&root.cores);
-        gc.retain(|dk, strikes| {
-            let Some(core) = cores.get(dk) else {
-                return false;
-            };
-            // Spare a core that has a session or a peer again (the gc fix).
-            if !core.is_idle() {
-                return false;
+        let retired = {
+            let mut gc = lock(&root.gc);
+            let cores = lock(&root.cores);
+            let mut retired = Vec::new();
+            gc.retain(|dk, strikes| {
+                let Some(core) = cores.get(dk) else {
+                    return false;
+                };
+                // Spare a core that has a session or a peer again (the gc fix).
+                if !core.is_idle() {
+                    return false;
+                }
+                *strikes += 1;
+                if *strikes >= GC_STRIKES {
+                    core.close();
+                    retired.push((*dk, core.clone()));
+                }
+                true
+            });
+            retired
+        };
+        for (dk, core) in retired {
+            core.replication_closed().await;
+            let mut gc = lock(&root.gc);
+            let mut cores = lock(&root.cores);
+            if cores
+                .get(&dk)
+                .is_some_and(|current| current.same_instance(&core))
+            {
+                cores.remove(&dk);
+                gc.remove(&dk);
             }
-            *strikes += 1;
-            if *strikes < GC_STRIKES {
-                return true;
-            }
-            core.close();
-            cores.remove(dk);
-            false
-        });
-        if gc.is_empty() {
+        }
+        if lock(&root.gc).is_empty() {
             return;
         }
     }

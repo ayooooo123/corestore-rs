@@ -252,3 +252,48 @@ async fn a_stored_core_closed_here_still_serves_a_third_peer() {
         "the reopened core stays open while b uses it"
     );
 }
+
+#[tokio::test]
+async fn reopening_waits_for_the_previous_replication_actor_to_release_its_channels() {
+    let da = tempfile::tempdir().unwrap();
+    let db = tempfile::tempdir().unwrap();
+    let writer = Corestore::open(da.path()).unwrap();
+    let reader = Corestore::open(db.path()).unwrap();
+    let source = writer.get(GetOptions::name("writer")).await.unwrap();
+    source.append(&[b"first".as_slice()]).await.unwrap();
+    let key = *source.key();
+    let view = reader.get(GetOptions::key(key)).await.unwrap();
+    let (ma, mb) = link();
+    writer.replicate(&ma);
+    reader.replicate(&mb);
+    assert_eq!(
+        timeout(Duration::from_secs(5), view.get(0, Get::default()))
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap(),
+        b"first".as_slice()
+    );
+    let old = view.core().clone();
+    assert_eq!(old.peer_count(), 1);
+    drop(view);
+    assert!(old.is_closed());
+
+    // On this current-thread runtime, get must yield until the old actor has detached.
+    let reopened = reader.get(GetOptions::key(key)).await.unwrap();
+    assert!(!reopened.core().same_instance(&old));
+    assert_eq!(old.peer_count(), 0, "replacement published before teardown");
+    source.append(&[b"second".as_slice()]).await.unwrap();
+    assert_eq!(
+        timeout(Duration::from_secs(5), reopened.get(1, Get::default()))
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap(),
+        b"second".as_slice()
+    );
+    ma.destroy();
+    mb.destroy();
+    reader.close().await;
+    writer.close().await;
+}
