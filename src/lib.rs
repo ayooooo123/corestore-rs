@@ -10,7 +10,7 @@ use blake2b_simd::Params;
 use hypercore::crypto::{self, KeyPair};
 use hypercore::encryption::EncryptionOptions;
 use hypercore::replicator::PROTOCOL;
-use hypercore::storage::{Alias, StorageError, Store};
+use hypercore::storage::{Alias, StorageError, Store, StoreOptions};
 use hypercore::{Core, CoreError, CoreOptions, GroupUpdate, Manifest, Session};
 use protomux::Mux;
 use tokio::sync::mpsc;
@@ -214,27 +214,37 @@ pub struct Corestore {
 impl Corestore {
     /// Opens the corestore in `dir`, creating a random primary key the first time.
     pub fn open(dir: &Path) -> Result<Corestore> {
-        Self::open_with(dir, None, false)
+        Self::open_with(dir, None, false, StoreOptions::default())
+    }
+
+    /// Opens a store with an explicit durability policy for rebuildable caches.
+    pub fn open_with_options(dir: &Path, options: StoreOptions) -> Result<Corestore> {
+        Self::open_with(dir, None, false, options)
     }
 
     /// Opens with a known primary key (JS `primaryKey` with `unsafe: true`).
     pub fn open_with_primary_key(dir: &Path, primary_key: [u8; 32]) -> Result<Corestore> {
-        Self::open_with(dir, Some(primary_key), false)
+        Self::open_with(dir, Some(primary_key), false, StoreOptions::default())
     }
 
     pub fn open_read_only(dir: &Path) -> Result<Corestore> {
-        Self::open_with(dir, None, true)
+        Self::open_with(dir, None, true, StoreOptions::default())
     }
 
     pub fn read_only(&self) -> bool {
         self.root.store.read_only()
     }
 
-    fn open_with(dir: &Path, wanted: Option<[u8; 32]>, read_only: bool) -> Result<Corestore> {
+    fn open_with(
+        dir: &Path,
+        wanted: Option<[u8; 32]>,
+        read_only: bool,
+        options: StoreOptions,
+    ) -> Result<Corestore> {
         let store = if read_only {
             Store::open_read_only(dir)?
         } else {
-            Store::open(dir)?
+            Store::open_with_options(dir, options)?
         };
         // The primary key is the store head's seed (`_getOrSetSeed`).
         let primary_key = match store.seed()? {

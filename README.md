@@ -41,6 +41,9 @@ store.replicate(&mux); // every open core, plus any stored core the remote asks 
   group and group-update rows. `set_alias` and `namespace_raw` write and read those rows directly.
 - Named aliases are persisted, and `storage_infos` reads stored heads without opening cores.
   `open_read_only` rejects writes. `close` invalidates existing handles and releases storage.
+  `open_with_options(dir, hypercore::storage::StoreOptions { wal: false })` opts a
+  rebuildable cache out of WAL durability; normal opens and owned writer cores must
+  keep the default WAL policy.
 
 Not ported: groups and group notifications, `staticify`, `suspend`/`resume`, and `audit`.
 
