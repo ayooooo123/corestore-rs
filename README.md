@@ -41,9 +41,11 @@ store.replicate(&mux); // every open core, plus any stored core the remote asks 
   group and group-update rows. `set_alias` and `namespace_raw` write and read those rows directly.
 - Named aliases are persisted, and `storage_infos` reads stored heads without opening cores.
   `open_read_only` rejects writes. `close` invalidates existing handles and releases storage.
-  `open_with_options(dir, hypercore::storage::StoreOptions { wal: false })` opts a
+  `open_with_options(dir, hypercore::storage::StoreOptions { wal: false, ..Default::default() })` opts a
   rebuildable cache out of WAL durability; normal opens and owned writer cores must
   keep the default WAL policy.
+  `StoreOptions { memory: true, ..Default::default() }` instead keeps the entire store
+  in a fresh RocksDB MemEnv; closing discards it, without media files on disk.
 
 Not ported: groups and group notifications, `staticify`, `suspend`/`resume`, and `audit`.
 
