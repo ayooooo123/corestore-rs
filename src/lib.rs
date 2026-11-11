@@ -200,9 +200,7 @@ impl FindingPeers {
         state
             .count
             .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-        Self {
-            state: Some(state),
-        }
+        Self { state: Some(state) }
     }
 
     /// JS's `done()`; dropping the guard does the same.
@@ -223,11 +221,7 @@ impl Drop for FindingPeers {
 
 impl FindingState {
     fn release_if_last(&self) {
-        if self
-            .count
-            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel)
-            == 1
-        {
+        if self.count.fetch_sub(1, std::sync::atomic::Ordering::AcqRel) == 1 {
             self.release();
         }
     }

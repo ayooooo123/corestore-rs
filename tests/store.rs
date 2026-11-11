@@ -303,7 +303,9 @@ async fn purging_a_named_core_frees_its_name() {
     let dir = tempfile::tempdir().unwrap();
     let store = Corestore::open(dir.path()).unwrap();
     let core = store.get(GetOptions::name("job")).await.unwrap();
-    core.append(&[b"half".as_slice(), b"written"]).await.unwrap();
+    core.append(&[b"half".as_slice(), b"written"])
+        .await
+        .unwrap();
     let discovery_key = *core.discovery_key();
     core.close();
     assert!(store.purge(&discovery_key).await.unwrap());
@@ -348,11 +350,7 @@ async fn force_purges_the_core_a_session_still_holds() {
 async fn finding_peers_holds_this_instances_updates_until_released() {
     let dir = tempfile::tempdir().unwrap();
     let store = Corestore::open(dir.path()).unwrap();
-    let absent = *store
-        .get(GetOptions::name("absent"))
-        .await
-        .unwrap()
-        .key();
+    let absent = *store.get(GetOptions::name("absent")).await.unwrap().key();
     let earliest = store.get(GetOptions::key(absent)).await.unwrap();
 
     let guard = store.finding_peers();
@@ -365,9 +363,7 @@ async fn finding_peers_holds_this_instances_updates_until_released() {
         ("fresh", &mut fresh_update),
     ] {
         assert!(
-            timeout(Duration::from_millis(200), update)
-                .await
-                .is_err(),
+            timeout(Duration::from_millis(200), update).await.is_err(),
             "{name}: a held findingPeers guard keeps the update waiting"
         );
     }
@@ -390,11 +386,7 @@ async fn finding_peers_holds_this_instances_updates_until_released() {
 async fn releasing_the_last_finding_peers_guard_concludes_pending_updates() {
     let dir = tempfile::tempdir().unwrap();
     let store = Corestore::open(dir.path()).unwrap();
-    let absent = *store
-        .get(GetOptions::name("absent"))
-        .await
-        .unwrap()
-        .key();
+    let absent = *store.get(GetOptions::name("absent")).await.unwrap().key();
     let core = store.get(GetOptions::key(absent)).await.unwrap();
 
     let guard = store.finding_peers();
@@ -405,5 +397,10 @@ async fn releasing_the_last_finding_peers_guard_concludes_pending_updates() {
             .is_err()
     );
     guard.release();
-    assert!(!timeout(Duration::from_secs(5), update).await.unwrap().unwrap());
+    assert!(
+        !timeout(Duration::from_secs(5), update)
+            .await
+            .unwrap()
+            .unwrap()
+    );
 }
