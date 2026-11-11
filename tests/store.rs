@@ -297,3 +297,113 @@ async fn reopening_waits_for_the_previous_replication_actor_to_release_its_chann
     reader.close().await;
     writer.close().await;
 }
+
+#[tokio::test]
+async fn purging_a_named_core_frees_its_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Corestore::open(dir.path()).unwrap();
+    let core = store.get(GetOptions::name("job")).await.unwrap();
+    core.append(&[b"half".as_slice(), b"written"]).await.unwrap();
+    let discovery_key = *core.discovery_key();
+    core.close();
+    assert!(store.purge(&discovery_key).await.unwrap());
+
+    let reopened = store
+        .get(GetOptions::name("job"))
+        .await
+        .expect("the name opens a fresh core");
+    assert_eq!(reopened.length(), 0, "the purged blocks are gone");
+    assert_eq!(store.list().unwrap(), vec![*reopened.discovery_key()]);
+    reopened.append(&[b"again".as_slice()]).await.unwrap();
+    assert_eq!(reopened.length(), 1);
+}
+
+#[tokio::test]
+async fn force_purges_the_core_a_session_still_holds() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Corestore::open(dir.path()).unwrap();
+    let held = store.get(GetOptions::name("held")).await.unwrap();
+    held.append(&[b"one".as_slice()]).await.unwrap();
+    let discovery_key = *held.discovery_key();
+
+    assert!(
+        !store.purge(&discovery_key).await.unwrap(),
+        "an open session keeps the core"
+    );
+    assert_eq!(held.length(), 1);
+    assert!(store.purge_with(&discovery_key, true).await.unwrap());
+    assert!(held.is_closed(), "a forced purge closes its sessions");
+
+    let again = store.get(GetOptions::name("held")).await.unwrap();
+    assert_eq!(again.length(), 0, "the purged blocks are gone");
+    assert_eq!(
+        again.discovery_key(),
+        &discovery_key,
+        "a name derives the same key"
+    );
+    assert_eq!(store.list().unwrap(), vec![discovery_key]);
+}
+
+#[tokio::test]
+async fn finding_peers_holds_this_instances_updates_until_released() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Corestore::open(dir.path()).unwrap();
+    let absent = *store
+        .get(GetOptions::name("absent"))
+        .await
+        .unwrap()
+        .key();
+    let earliest = store.get(GetOptions::key(absent)).await.unwrap();
+
+    let guard = store.finding_peers();
+    // A core opened while the instance is finding peers waits too.
+    let fresh = store.get(GetOptions::name("fresh")).await.unwrap();
+    let mut earlier_update = Box::pin(earliest.update(None));
+    let mut fresh_update = Box::pin(fresh.update(None));
+    for (name, update) in [
+        ("earlier", &mut earlier_update as &mut std::pin::Pin<Box<_>>),
+        ("fresh", &mut fresh_update),
+    ] {
+        assert!(
+            timeout(Duration::from_millis(200), update)
+                .await
+                .is_err(),
+            "{name}: a held findingPeers guard keeps the update waiting"
+        );
+    }
+    guard.release();
+    for (name, update) in [
+        ("earlier", &mut earlier_update as &mut std::pin::Pin<Box<_>>),
+        ("fresh", &mut fresh_update),
+    ] {
+        assert!(
+            !timeout(Duration::from_secs(5), update)
+                .await
+                .unwrap()
+                .unwrap(),
+            "{name}: releasing the guard concludes the update"
+        );
+    }
+}
+
+#[tokio::test]
+async fn releasing_the_last_finding_peers_guard_concludes_pending_updates() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Corestore::open(dir.path()).unwrap();
+    let absent = *store
+        .get(GetOptions::name("absent"))
+        .await
+        .unwrap()
+        .key();
+    let core = store.get(GetOptions::key(absent)).await.unwrap();
+
+    let guard = store.finding_peers();
+    let mut update = Box::pin(core.update(None));
+    assert!(
+        timeout(Duration::from_millis(200), &mut update)
+            .await
+            .is_err()
+    );
+    guard.release();
+    assert!(!timeout(Duration::from_secs(5), update).await.unwrap().unwrap());
+}

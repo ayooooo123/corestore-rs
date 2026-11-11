@@ -170,13 +170,121 @@ struct Root {
 #[derive(Default)]
 struct Scope {
     sessions: Mutex<Option<Vec<hypercore::core::WeakSession>>>,
+    /// JS `_findingPeers`: this instance's counter and the guards it holds on its cores.
+    finding: Mutex<Option<Arc<FindingState>>>,
+}
+
+/// The live `findingPeers` count of one store instance and the guards it has placed.
+struct FindingState {
+    count: std::sync::atomic::AtomicUsize,
+    guards: Mutex<Vec<hypercore::FindingPeers>>,
+}
+
+impl FindingState {
+    fn release(&self) {
+        for guard in lock(&self.guards).drain(..) {
+            guard.release();
+        }
+    }
+}
+
+/// `store.findingPeers()`: while one is held, cores opened by this store instance do not
+/// conclude in `update()` that no update is available before a peer arrives. JS's `done`.
+pub struct FindingPeers {
+    state: Option<Arc<FindingState>>,
+}
+
+impl FindingPeers {
+    #[allow(clippy::new_without_default)]
+    fn new(state: Arc<FindingState>) -> Self {
+        state
+            .count
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        Self {
+            state: Some(state),
+        }
+    }
+
+    /// JS's `done()`; dropping the guard does the same.
+    pub fn release(mut self) {
+        if let Some(state) = self.state.take() {
+            state.release_if_last();
+        }
+    }
+}
+
+impl Drop for FindingPeers {
+    fn drop(&mut self) {
+        if let Some(state) = self.state.take() {
+            state.release_if_last();
+        }
+    }
+}
+
+impl FindingState {
+    fn release_if_last(&self) {
+        if self
+            .count
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel)
+            == 1
+        {
+            self.release();
+        }
+    }
 }
 
 impl Scope {
     fn new() -> Self {
         Self {
             sessions: Mutex::new(Some(Vec::new())),
+            finding: Mutex::new(None),
         }
+    }
+
+    /// The instance's `findingPeers` state, created on first use.
+    fn finding(&self) -> Option<Arc<FindingState>> {
+        let mut finding = lock(&self.finding);
+        if let Some(state) = finding.as_ref() {
+            return Some(Arc::clone(state));
+        }
+        // A closed scope takes no new guards.
+        lock(&self.sessions).as_ref()?;
+        let state = Arc::new(FindingState {
+            count: std::sync::atomic::AtomicUsize::new(0),
+            guards: Mutex::new(Vec::new()),
+        });
+        *finding = Some(state.clone());
+        Some(state)
+    }
+
+    /// Places a guard on every live session of this scope, as JS's `FindingPeers.inc` does.
+    fn hold_finding(&self, state: &FindingState) {
+        let sessions = lock(&self.sessions);
+        let Some(sessions) = sessions.as_ref() else {
+            return;
+        };
+        let mut guards = lock(&state.guards);
+        for session in sessions {
+            if let Some(guard) = session.finding_peers() {
+                guards.push(guard);
+            }
+        }
+    }
+
+    /// Closes every live session on `discovery_key` (JS `core.closeAllSessions`).
+    fn close_sessions(&self, discovery_key: &[u8; 32]) -> usize {
+        let mut closed = 0;
+        let sessions = lock(&self.sessions);
+        let Some(sessions) = sessions.as_ref() else {
+            return 0;
+        };
+        for session in sessions {
+            if session.discovery_key().as_ref() == Some(discovery_key) {
+                session.close();
+                closed += 1;
+            }
+        }
+        closed
     }
 
     fn register(&self, session: &Session) -> Result<()> {
@@ -340,6 +448,24 @@ impl Corestore {
         })
     }
 
+    /// JS `store.findingPeers()`: hold this while this store instance's cores are still looking
+    /// for peers. Every core it opens (now or while held) waits in `update()` instead of
+    /// concluding that no update is available, and releasing the last guard concludes them.
+    pub fn finding_peers(&self) -> FindingPeers {
+        let state = self.scope.finding();
+        match state {
+            Some(state) => {
+                let guard = FindingPeers::new(Arc::clone(&state));
+                // JS `FindingPeers.inc`: the first holder guards every session already open.
+                if state.count.load(std::sync::atomic::Ordering::Acquire) == 1 {
+                    self.scope.hold_finding(&state);
+                }
+                guard
+            }
+            None => FindingPeers { state: None },
+        }
+    }
+
     /// Opens an independent scope in the default namespace.
     pub fn session(&self) -> Corestore {
         self.child(DEFAULT_NAMESPACE)
@@ -377,6 +503,14 @@ impl Corestore {
             }
         };
         self.scope.register(&session)?;
+        // JS `FindingPeers.add`: a session opened while the instance is still finding peers
+        // waits for them too. At count 0 the state exists but places nothing, as in JS.
+        let finding = lock(&self.scope.finding).as_ref().map(Arc::clone);
+        if let Some(finding) = finding
+            && finding.count.load(std::sync::atomic::Ordering::Acquire) > 0
+        {
+            lock(&finding.guards).push(session.finding_peers());
+        }
         if exclusive {
             session.acquire_exclusive().await?;
         }
@@ -540,6 +674,13 @@ impl Corestore {
 
     /// Deletes a stored core unless something still uses it (JS `store.purge`).
     pub async fn purge(&self, discovery_key: &[u8; 32]) -> Result<bool> {
+        self.purge_with(discovery_key, false).await
+    }
+
+    /// JS `store.purge(key, { force })`: `force` closes the sessions this store holds on the
+    /// core first, where a plain purge leaves a core with live sessions alone. Either way the
+    /// name aliases pointing at the core go with it, so the same name opens a fresh core.
+    pub async fn purge_with(&self, discovery_key: &[u8; 32], force: bool) -> Result<bool> {
         let core = match self.resume(discovery_key).await {
             Some(c) => c,
             None => match Core::open_by_discovery_key(
@@ -553,7 +694,14 @@ impl Corestore {
             },
         };
         if core.active_session_count() > 0 {
-            return Ok(false);
+            if !force {
+                return Ok(false);
+            }
+            self.close_sessions(discovery_key);
+            if core.active_session_count() > 0 {
+                // Sessions this store never opened (a bare `Core` handle) keep the core alive.
+                return Ok(false);
+            }
         }
         core.close();
         core.replication_closed().await;
@@ -569,7 +717,37 @@ impl Corestore {
             }
         }
         core.purge().await?;
+        self.forget_aliases(discovery_key)?;
         Ok(true)
+    }
+
+    /// Every scope this store instance and the ones it shares its root with have opened.
+    fn scopes(&self) -> Vec<Arc<Scope>> {
+        let mut scopes = vec![self.scope.clone()];
+        for scope in lock(&self.root.scopes).iter().filter_map(Weak::upgrade) {
+            if !Arc::ptr_eq(&scope, &self.scope) {
+                scopes.push(scope);
+            }
+        }
+        scopes
+    }
+
+    /// Closes this store's live sessions on `discovery_key` (JS `core.closeAllSessions`).
+    fn close_sessions(&self, discovery_key: &[u8; 32]) {
+        for scope in self.scopes() {
+            scope.close_sessions(discovery_key);
+        }
+    }
+
+    /// Drops every name alias pointing at a deleted core, as JS `deleteCore` does: the same
+    /// name must open an empty core again, not resolve to the row that is gone.
+    fn forget_aliases(&self, discovery_key: &[u8; 32]) -> Result<()> {
+        for (alias, target) in self.root.store.aliases()? {
+            if target == *discovery_key {
+                self.root.store.delete_alias(&alias, discovery_key)?;
+            }
+        }
+        Ok(())
     }
 }
 
